@@ -23,7 +23,7 @@ TRADE_CONFIG = {
     "htf_confirmation": True,    # NEW — only trade when 1H EMA50 agrees with 15min signal
     "conflict_mode": "risky",
     "news_lookback_hours": 6,
-    "poll_interval_seconds": 30,
+    "poll_interval_seconds": 300,
     "oanda_units": 1,
 }
 

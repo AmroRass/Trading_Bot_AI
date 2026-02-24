@@ -139,8 +139,8 @@ def run_cycle():
         if execution.get("status") == "submitted":
             price = trend["close"]
             side  = signal.get("action")
-            tp    = signal.get("tp_price")
-            sl    = signal.get("sl_price")
+            tp    = signal.get("take_profit")
+            sl    = signal.get("stop_loss")
 
             _open_position["active"]      = True
             _open_position["side"]        = side

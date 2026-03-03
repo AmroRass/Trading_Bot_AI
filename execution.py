@@ -57,8 +57,8 @@ def submit_order(signal: dict) -> dict:
     else:
         units = abs(units)
 
-    tp_price = str(round(signal["take_profit"], 4))
-    sl_price = str(round(signal["stop_loss"], 4))
+    tp_price = str(round(signal["take_profit"], 2))
+    sl_price = str(round(signal["stop_loss"], 2))
 
     try:
         mkt_order = MarketOrderRequest(
@@ -84,6 +84,7 @@ def submit_order(signal: dict) -> dict:
         }
 
     except V20Error as e:
+        print(f"[EXEC] OANDA error: {e}")
         return {
             "status": "error",
             "error":  str(e),

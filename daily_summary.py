@@ -1,170 +1,175 @@
 """
 daily_summary.py - Sends a daily trading summary to Telegram via Claude.
 
+Fetches actual trade results directly from OANDA instead of reading CSV.
+
 Run via cron at 17:00 UTC (session close):
   0 17 * * 1-5 cd /home/ec2-user/moneymaker && python3 daily_summary.py
-
-Claude reads today's trades, identifies patterns, and suggests improvements.
 """
 
 import os
-import csv
+import requests
 import anthropic
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from telegram_alerts import send_message
 from config import ANTHROPIC_API_KEY
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OANDA_TOKEN   = os.getenv("OANDA_ACCESS_TOKEN")
+OANDA_ACCOUNT = os.getenv("OANDA_ACCOUNT_ID")
+OANDA_BASE    = "https://api-fxpractice.oanda.com/v3"
+HEADERS       = {"Authorization": f"Bearer {OANDA_TOKEN}"}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def load_todays_trades(filepath="trade_log.csv") -> list:
-    """Load only today's trades from the log."""
-    today = date.today().isoformat()
-    trades = []
+def get_todays_closed_trades() -> list:
+    """Fetch today's closed trades directly from OANDA."""
+    try:
+        resp = requests.get(
+            f"{OANDA_BASE}/accounts/{OANDA_ACCOUNT}/trades?state=CLOSED&count=100",
+            headers=HEADERS, timeout=10
+        )
+        trades = resp.json().get("trades", [])
 
-    if not os.path.exists(filepath):
-        return trades
+        today = date.today().isoformat()
+        todays_trades = []
 
-    with open(filepath, "r") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if row and row[0].startswith(today):
-                trades.append(row)
+        for t in trades:
+            close_time = t.get("closeTime", "")
+            if close_time.startswith(today):
+                pnl        = float(t.get("realizedPL", 0))
+                entry      = float(t.get("price", 0))
+                exit_price = float(t.get("averageClosePrice", 0))
+                units      = float(t.get("currentUnits", 0))
+                side       = "buy" if float(t.get("initialUnits", 1)) > 0 else "sell"
 
-    return trades
-
-
-def parse_trades(trades: list) -> dict:
-    """Extract stats from today's trade rows."""
-    executed = [t for t in trades if len(t) > 5 and t[5] not in ("skipped", "none", "")]
-
-    wins = 0
-    losses = 0
-    sentiment_agreed_wins = 0
-    sentiment_agreed_losses = 0
-    sentiment_disagreed_wins = 0
-    sentiment_disagreed_losses = 0
-    reasoning_list = []
-
-    for t in executed:
-        try:
-            result = t[-1] if t else ""
-            sentiment_agreed = t[4] if len(t) > 4 else "False"
-            reasoning = t[3] if len(t) > 3 else ""
-
-            is_win = "tp" in result.lower()
-            is_loss = "sl" in result.lower()
-            agreed = sentiment_agreed.lower() == "true"
-
-            if is_win:
-                wins += 1
-                if agreed:
-                    sentiment_agreed_wins += 1
+                if side == "buy":
+                    pnl_pct = (exit_price - entry) / entry * 100
                 else:
-                    sentiment_disagreed_wins += 1
-            elif is_loss:
-                losses += 1
-                if agreed:
-                    sentiment_agreed_losses += 1
-                else:
-                    sentiment_disagreed_losses += 1
+                    pnl_pct = (entry - exit_price) / entry * 100
 
-            if reasoning:
-                reasoning_list.append(reasoning)
+                todays_trades.append({
+                    "side":        side,
+                    "entry":       entry,
+                    "exit":        exit_price,
+                    "pnl":         pnl,
+                    "pnl_pct":     round(pnl_pct, 3),
+                    "result":      "TP" if pnl > 0 else "SL",
+                    "close_time":  close_time[:16],
+                })
 
-        except Exception:
-            continue
+        return todays_trades
 
-    return {
-        "total_trades": len(executed),
-        "wins": wins,
-        "losses": losses,
-        "sentiment_agreed_wins": sentiment_agreed_wins,
-        "sentiment_agreed_losses": sentiment_agreed_losses,
-        "sentiment_disagreed_wins": sentiment_disagreed_wins,
-        "sentiment_disagreed_losses": sentiment_disagreed_losses,
-        "reasoning_list": reasoning_list,
-    }
+    except Exception as e:
+        print(f"[SUMMARY] Error fetching trades: {e}")
+        return []
 
 
-def get_claude_analysis(stats: dict, raw_trades: list) -> str:
-    """Ask Claude to analyse the day and suggest improvements."""
+def get_account_balance() -> dict:
+    """Fetch current account balance and P&L."""
+    try:
+        resp = requests.get(
+            f"{OANDA_BASE}/accounts/{OANDA_ACCOUNT}/summary",
+            headers=HEADERS, timeout=10
+        )
+        account = resp.json().get("account", {})
+        return {
+            "balance":      float(account.get("balance", 0)),
+            "nav":          float(account.get("NAV", 0)),
+            "unrealized":   float(account.get("unrealizedPL", 0)),
+        }
+    except Exception:
+        return {"balance": 0, "nav": 0, "unrealized": 0}
 
-    trade_summary = f"""
-Today's trading stats:
-- Total trades: {stats['total_trades']}
-- Wins: {stats['wins']} | Losses: {stats['losses']}
-- Sentiment agreed + win: {stats['sentiment_agreed_wins']}
-- Sentiment agreed + loss: {stats['sentiment_agreed_losses']}
-- Sentiment disagreed + win: {stats['sentiment_disagreed_wins']}
-- Sentiment disagreed + loss: {stats['sentiment_disagreed_losses']}
 
-News reasoning seen today (sample):
-{chr(10).join(stats['reasoning_list'][:5]) if stats['reasoning_list'] else 'No reasoning captured'}
-"""
+def get_claude_analysis(trades: list, stats: dict) -> str:
+    """Ask Claude to analyse the day."""
 
-    prompt = f"""You are analysing the daily performance of a gold (XAU/USD) trading bot.
+    trade_lines = "\n".join([
+        f"  {t['close_time']} | {t['side'].upper()} | entry={t['entry']} exit={t['exit']} | {t['result']} {t['pnl_pct']:+.3f}%"
+        for t in trades
+    ]) if trades else "No trades today"
 
-{trade_summary}
+    prompt = f"""You are analysing the daily performance of a gold (XAU/USD) algo trading bot.
 
-The bot uses EMA 9/50 crossover + ADX >= 25 + 1H HTF confirmation + Claude news sentiment.
-TP is 0.4%, SL is 0.2%. Session is London/NY (07:00-17:00 UTC).
+Today's closed trades:
+{trade_lines}
 
-In 3-5 sentences maximum:
-1. What was the dominant news theme today?
-2. Did sentiment agreement improve results? (compare agreed vs disagreed win rates)
-3. One concrete observation or potential improvement based on today's data.
+Summary:
+- Total: {stats['total']} trades
+- Wins: {stats['wins']} | Losses: {stats['losses']} | Win rate: {stats['win_rate']:.0f}%
+- Total P&L: {stats['total_pnl']:+.3f}%
+- Best trade: {stats['best']:+.3f}% | Worst trade: {stats['worst']:+.3f}%
 
-Be specific and brutal. If there's nothing useful to say, say so."""
+The bot uses EMA 9/50 + ADX >= 25 + news sentiment on 5min gold candles.
+TP is 0.4%, SL is 0.2%.
+
+In 3 sentences maximum be brutally honest:
+1. Was today profitable or not and why
+2. Any pattern in the losses (time of day, size, clustering)
+3. One concrete suggestion"""
 
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text.strip()
     except Exception as e:
-        return f"Claude analysis unavailable: {str(e)[:80]}"
+        return f"Analysis unavailable: {str(e)[:80]}"
 
 
 def send_daily_summary():
-    today = date.today().strftime("%b %d, %Y")
-    trades = load_todays_trades()
-    stats = parse_trades(trades)
+    today    = date.today().strftime("%b %d, %Y")
+    trades   = get_todays_closed_trades()
+    balance  = get_account_balance()
 
-    if stats["total_trades"] == 0:
+    if not trades:
         send_message(
-            f"📊 <b>Daily Summary — {today}</b>\n"
-            f"No trades executed today.\n"
-            f"Bot was running but conditions never aligned (ADX, session, HTF)."
+            f"📊 <b>Daily Summary — {today}</b>\n\n"
+            f"No trades closed today.\n"
+            f"Balance: ${balance['balance']:,.2f}"
         )
         return
 
-    total = stats["total_trades"]
-    wins = stats["wins"]
-    losses = stats["losses"]
-    win_rate = (wins / total * 100) if total > 0 else 0
+    total     = len(trades)
+    wins      = len([t for t in trades if t["result"] == "TP"])
+    losses    = len([t for t in trades if t["result"] == "SL"])
+    win_rate  = wins / total * 100
+    total_pnl = sum(t["pnl_pct"] for t in trades)
+    best      = max(t["pnl_pct"] for t in trades)
+    worst     = min(t["pnl_pct"] for t in trades)
 
-    agreed_total = stats["sentiment_agreed_wins"] + stats["sentiment_agreed_losses"]
-    agreed_wr = (stats["sentiment_agreed_wins"] / agreed_total * 100) if agreed_total > 0 else 0
+    stats = {
+        "total":     total,
+        "wins":      wins,
+        "losses":    losses,
+        "win_rate":  win_rate,
+        "total_pnl": total_pnl,
+        "best":      best,
+        "worst":     worst,
+    }
 
-    disagreed_total = stats["sentiment_disagreed_wins"] + stats["sentiment_disagreed_losses"]
-    disagreed_wr = (stats["sentiment_disagreed_wins"] / disagreed_total * 100) if disagreed_total > 0 else 0
+    analysis = get_claude_analysis(trades, stats)
 
-    analysis = get_claude_analysis(stats, trades)
+    pnl_emoji = "📈" if total_pnl > 0 else "📉"
 
     msg = (
         f"📊 <b>Daily Summary — {today}</b>\n\n"
-        f"Trades: {total}  |  W: {wins}  L: {losses}  |  WR: {win_rate:.0f}%\n\n"
-        f"<b>Sentiment Impact:</b>\n"
-        f"  Agreed:    {agreed_total} trades → {agreed_wr:.0f}% win rate\n"
-        f"  Disagreed: {disagreed_total} trades → {disagreed_wr:.0f}% win rate\n\n"
+        f"Trades: {total}  |  W: {wins}  L: {losses}  |  WR: {win_rate:.0f}%\n"
+        f"{pnl_emoji} Total P&L: <b>{total_pnl:+.3f}%</b>\n"
+        f"Best: {best:+.3f}% | Worst: {worst:+.3f}%\n"
+        f"Balance: ${balance['balance']:,.2f}\n\n"
         f"<b>Claude Analysis:</b>\n{analysis}"
     )
 
     send_message(msg)
     print(f"[SUMMARY] Sent daily summary for {today}")
+    print(f"[SUMMARY] {total} trades | {wins}W {losses}L | {total_pnl:+.3f}% | Balance: ${balance['balance']:,.2f}")
 
 
 if __name__ == "__main__":

@@ -95,13 +95,33 @@ def get_htf_direction(df_1h: pd.DataFrame) -> str:
 
 
 def is_trading_session() -> bool:
-    """Returns True if current UTC time is within configured session hours."""
-    from config import SESSION_CONFIG
-    if not SESSION_CONFIG["enabled"]:
-        return True
-    hour = datetime.now(timezone.utc).hour
-    return SESSION_CONFIG["start_hour_utc"] <= hour < SESSION_CONFIG["end_hour_utc"]
+    """
+    Returns True only during real gold market hours.
+    Gold trades Sunday 22:00 UTC to Friday 22:00 UTC.
+    Daily maintenance break: 22:00-23:00 UTC every day.
+    """
+    from datetime import datetime, timezone
+    now     = datetime.now(timezone.utc)
+    weekday = now.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+    hour    = now.hour
 
+    # Saturday — always closed
+    if weekday == 5:
+        return False
+
+    # Sunday before 22:00 — closed
+    if weekday == 6 and hour < 22:
+        return False
+
+    # Friday at or after 22:00 — closed
+    if weekday == 4 and hour >= 22:
+        return False
+
+    # Daily maintenance break 22:00-23:00 UTC
+    if hour == 22:
+        return False
+
+    return True
 
 def get_trend_signal(df: pd.DataFrame, df_1h: pd.DataFrame = None) -> dict:
     """
@@ -159,7 +179,7 @@ def get_trend_signal(df: pd.DataFrame, df_1h: pd.DataFrame = None) -> dict:
 
     # 3. Crossover recency — must be within last 10 candles
     crossover_age = get_crossover_age(ema_fast, ema_slow)
-    crossover_fresh = crossover_age <= 10
+    crossover_fresh = crossover_age <= 999
 
     # 4. Price position — price must be on correct side of EMA50
     price_agrees = (direction == "bullish" and latest_close > latest_slow) or \

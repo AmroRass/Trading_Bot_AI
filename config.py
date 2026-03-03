@@ -7,13 +7,13 @@ ASSET_CONFIG = {
     "name": "Gold",
     "finnhub_symbol": "OANDA:XAU_USD",
     "oanda_instrument": "XAU_USD",
-    "news_keywords": ["gold", "XAU", "fed", "inflation", "dollar", "interest rate", "central bank", "safe haven", "geopolitical"],
+    "news_keywords": ["gold", "XAU", "fed", "inflation", "dollar", "interest rate", "central bank", "safe haven", "geopolitical", "treasury", "tariff", "silver", "commodity"],
     "description": "Gold Spot vs USD"
 }
 
 # Trading parameters — validated via rigorous walk-forward backtest (15 months)
 TRADE_CONFIG = {
-    "timeframe": "15",           # minutes
+    "timeframe": "5",           # minutes
     "ema_fast": 9,
     "ema_slow": 50,              # changed from 21 — confirmed better via backtest
     "adx_period": 14,
@@ -21,17 +21,17 @@ TRADE_CONFIG = {
     "take_profit_pct": 0.004,    # 0.4%
     "stop_loss_pct": 0.002,      # changed from 0.003 — better risk/reward ratio
     "htf_confirmation": False,    # NEW — only trade when 1H EMA50 agrees with 15min signal
-    "conflict_mode": "conservative",
-    "news_lookback_hours": 6,
+    "conflict_mode": "risky",
+    "news_lookback_hours": 24,
     "poll_interval_seconds": 300,
     "oanda_units": 1,
 }
 
 # Session filter — only trade London + NY overlap (7am-5pm UTC)
 SESSION_CONFIG = {
-    "enabled": False,
+    "enabled": True,
     "start_hour_utc": 7,
-    "end_hour_utc": 17,
+    "end_hour_utc": 20,
 }
 
 # Sentiment thresholds

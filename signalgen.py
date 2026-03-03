@@ -1,5 +1,9 @@
 """
-signal.py - Combines technical trend + sentiment into a trade signal
+signalgen.py - Combines technical trend + sentiment into a trade signal.
+
+Asymmetric TP/SL:
+  BUY:  SL 0.3%, TP 0.6% — wider, gold has upward bias
+  SELL: SL 0.2%, TP 0.4% — tighter, counter-trend shorts must be quick
 """
 
 from config import TRADE_CONFIG
@@ -10,15 +14,14 @@ def generate_signal(trend: dict, sentiment: dict) -> dict:
     Combines trend and sentiment into a final trade signal.
 
     conflict_mode:
-        "risky"        - trade even if signals conflict, log the conflict
+        "risky"        - trade even if signals conflict, follow technicals
         "conservative" - only trade when both agree
     """
-    tech_direction  = trend.get("direction", "neutral")
-    sent_direction  = sentiment.get("direction", "neutral")
-    tech_confirmed  = trend.get("confirmed", False)
-    conflict_mode   = TRADE_CONFIG["conflict_mode"]
+    tech_direction = trend.get("direction", "neutral")
+    sent_direction = sentiment.get("direction", "neutral")
+    tech_confirmed = trend.get("confirmed", False)
+    conflict_mode  = TRADE_CONFIG["conflict_mode"]
 
-    # Map directions to action
     def to_action(direction):
         if direction == "bullish": return "buy"
         if direction == "bearish": return "sell"
@@ -31,31 +34,36 @@ def generate_signal(trend: dict, sentiment: dict) -> dict:
     if not tech_action and not sent_action:
         return _no_trade("Both signals neutral")
 
-    # Technical trend not confirmed by ADX = weak signal
+    # Technical trend not confirmed = no trade
     if not tech_confirmed:
         return _no_trade(f"Trend not confirmed by ADX (strength={trend.get('strength', 0):.1f})")
 
     signals_agree = tech_action == sent_action
 
     if signals_agree:
-        action = tech_action
+        action      = tech_action
         signal_type = "strong"
-        reason = f"Both agree: tech={tech_direction}, sentiment={sent_direction}"
+        reason      = f"Both agree: tech={tech_direction}, sentiment={sent_direction}"
     else:
-        # They conflict
         if conflict_mode == "risky":
-            # Take the trade anyway, bias toward technicals
-            action = tech_action or sent_action
+            action      = tech_action or sent_action
             signal_type = "weak"
-            reason = f"CONFLICT (risky mode): tech={tech_direction}, sentiment={sent_direction} → following tech"
+            reason      = f"CONFLICT (risky mode): tech={tech_direction}, sentiment={sent_direction} → following tech"
         else:
             return _no_trade(f"Conflict: tech={tech_direction}, sentiment={sent_direction}")
 
     price = trend.get("close", 0)
-    tp = round(price * (1 + TRADE_CONFIG["take_profit_pct"]) if action == "buy"
-               else price * (1 - TRADE_CONFIG["take_profit_pct"]), 4)
-    sl = round(price * (1 - TRADE_CONFIG["stop_loss_pct"]) if action == "buy"
-               else price * (1 + TRADE_CONFIG["stop_loss_pct"]), 4)
+
+    # Asymmetric TP/SL — buys get more room, sells stay tight
+    if action == "buy":
+        tp_pct = 0.006   # 0.6%
+        sl_pct = 0.003   # 0.3%
+    else:
+        tp_pct = TRADE_CONFIG["take_profit_pct"]   # 0.4%
+        sl_pct = TRADE_CONFIG["stop_loss_pct"]     # 0.2%
+
+    tp = round(price * (1 + tp_pct) if action == "buy" else price * (1 - tp_pct), 4)
+    sl = round(price * (1 - sl_pct) if action == "buy" else price * (1 + sl_pct), 4)
 
     return {
         "action":      action,

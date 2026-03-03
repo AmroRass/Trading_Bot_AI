@@ -1,175 +1,150 @@
 """
-daily_summary.py - Sends a daily trading summary to Telegram via Claude.
-
-Fetches actual trade results directly from OANDA instead of reading CSV.
-
-Run via cron at 17:00 UTC (session close):
-  0 17 * * 1-5 cd /home/ec2-user/moneymaker && python3 daily_summary.py
+daily_summary.py - Daily summary for both bots via Telegram.
+Run via cron at 17:00 UTC: 0 17 * * 1-5 cd /home/ec2-user && python3 daily_summary.py
 """
 
 import os
 import requests
 import anthropic
-from datetime import datetime, timezone, date, timedelta
-from telegram_alerts import send_message
-from config import ANTHROPIC_API_KEY
+from datetime import datetime, timezone, date
 from dotenv import load_dotenv
 
 load_dotenv()
 
 OANDA_TOKEN   = os.getenv("OANDA_ACCESS_TOKEN")
-OANDA_ACCOUNT = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_BASE    = "https://api-fxpractice.oanda.com/v3"
 HEADERS       = {"Authorization": f"Bearer {OANDA_TOKEN}"}
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+BOTS = {
+    "Conservative": "101-004-37417354-005",
+    "Risky":        "101-004-37417354-006",
+}
 
 
-def get_todays_closed_trades() -> list:
-    """Fetch today's closed trades directly from OANDA."""
+def send_message(text):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": text[:4093], "parse_mode": "HTML"}, timeout=5)
+    except Exception as e:
+        print(f"[TELEGRAM] {e}")
+
+
+def get_account(account_id):
+    try:
+        resp = requests.get(f"{OANDA_BASE}/accounts/{account_id}/summary", headers=HEADERS, timeout=10)
+        acc = resp.json().get("account", {})
+        return {"balance": float(acc.get("balance", 0)), "nav": float(acc.get("NAV", 0))}
+    except Exception:
+        return {"balance": 0, "nav": 0}
+
+
+def get_todays_trades(account_id):
     try:
         resp = requests.get(
-            f"{OANDA_BASE}/accounts/{OANDA_ACCOUNT}/trades?state=CLOSED&count=100",
+            f"{OANDA_BASE}/accounts/{account_id}/trades?state=CLOSED&count=100",
             headers=HEADERS, timeout=10
         )
         trades = resp.json().get("trades", [])
-
-        today = date.today().isoformat()
-        todays_trades = []
-
+        today  = date.today().isoformat()
+        result = []
         for t in trades:
-            close_time = t.get("closeTime", "")
-            if close_time.startswith(today):
-                pnl        = float(t.get("realizedPL", 0))
-                entry      = float(t.get("price", 0))
-                exit_price = float(t.get("averageClosePrice", 0))
-                units      = float(t.get("currentUnits", 0))
-                side       = "buy" if float(t.get("initialUnits", 1)) > 0 else "sell"
-
-                if side == "buy":
-                    pnl_pct = (exit_price - entry) / entry * 100
-                else:
-                    pnl_pct = (entry - exit_price) / entry * 100
-
-                todays_trades.append({
-                    "side":        side,
-                    "entry":       entry,
-                    "exit":        exit_price,
-                    "pnl":         pnl,
-                    "pnl_pct":     round(pnl_pct, 3),
-                    "result":      "TP" if pnl > 0 else "SL",
-                    "close_time":  close_time[:16],
-                })
-
-        return todays_trades
-
+            if not t.get("closeTime", "").startswith(today):
+                continue
+            pnl   = float(t.get("realizedPL", 0))
+            entry = float(t.get("price", 0))
+            exit_ = float(t.get("averageClosePrice", 0))
+            side  = "buy" if float(t.get("initialUnits", 1)) > 0 else "sell"
+            result.append({
+                "side":   side,
+                "entry":  entry,
+                "exit":   exit_,
+                "pnl":    pnl,
+                "result": "TP" if pnl > 0 else "SL",
+                "time":   t.get("closeTime", "")[:16],
+            })
+        return result
     except Exception as e:
-        print(f"[SUMMARY] Error fetching trades: {e}")
+        print(f"[SUMMARY] Error: {e}")
         return []
 
 
-def get_account_balance() -> dict:
-    """Fetch current account balance and P&L."""
-    try:
-        resp = requests.get(
-            f"{OANDA_BASE}/accounts/{OANDA_ACCOUNT}/summary",
-            headers=HEADERS, timeout=10
-        )
-        account = resp.json().get("account", {})
-        return {
-            "balance":      float(account.get("balance", 0)),
-            "nav":          float(account.get("NAV", 0)),
-            "unrealized":   float(account.get("unrealizedPL", 0)),
-        }
-    except Exception:
-        return {"balance": 0, "nav": 0, "unrealized": 0}
-
-
-def get_claude_analysis(trades: list, stats: dict) -> str:
-    """Ask Claude to analyse the day."""
-
-    trade_lines = "\n".join([
-        f"  {t['close_time']} | {t['side'].upper()} | entry={t['entry']} exit={t['exit']} | {t['result']} {t['pnl_pct']:+.3f}%"
+def get_claude_analysis(bot_name, trades, stats):
+    if not trades:
+        return "No trades today."
+    trade_lines = chr(10).join([
+        f"  {t['time']} | {t['side'].upper()} | {t['result']} | ${t['pnl']:+.2f}"
         for t in trades
-    ]) if trades else "No trades today"
+    ])
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": f"""Gold bot daily analysis for {bot_name}:
 
-    prompt = f"""You are analysing the daily performance of a gold (XAU/USD) algo trading bot.
-
-Today's closed trades:
 {trade_lines}
 
-Summary:
-- Total: {stats['total']} trades
-- Wins: {stats['wins']} | Losses: {stats['losses']} | Win rate: {stats['win_rate']:.0f}%
-- Total P&L: {stats['total_pnl']:+.3f}%
-- Best trade: {stats['best']:+.3f}% | Worst trade: {stats['worst']:+.3f}%
+Stats: {stats['total']} trades | {stats['wins']}W {stats['losses']}L | ${stats['total_pnl']:+.2f} total
 
-The bot uses EMA 9/50 + ADX >= 25 + news sentiment on 5min gold candles.
-TP is 0.4%, SL is 0.2%.
-
-In 3 sentences maximum be brutally honest:
-1. Was today profitable or not and why
-2. Any pattern in the losses (time of day, size, clustering)
-3. One concrete suggestion"""
-
-    try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}]
+In 2 sentences max: what pattern do you see and one concrete suggestion."""}]
         )
-        return response.content[0].text.strip()
+        return resp.content[0].text.strip()
     except Exception as e:
-        return f"Analysis unavailable: {str(e)[:80]}"
+        return f"Analysis unavailable: {str(e)[:60]}"
+
+
+def format_bot_section(name, account_id):
+    acc    = get_account(account_id)
+    trades = get_todays_trades(account_id)
+    bal    = acc["balance"]
+
+    if not trades:
+        return (
+            f"<b>{'Blue' if name == 'Conservative' else 'Red'} {name}</b>\n"
+            f"  Balance: ${bal:,.2f}\n"
+            f"  No trades today"
+        )
+
+    wins      = len([t for t in trades if t["result"] == "TP"])
+    losses    = len([t for t in trades if t["result"] == "SL"])
+    total     = len(trades)
+    total_pnl = sum(t["pnl"] for t in trades)
+    best      = max(t["pnl"] for t in trades)
+    worst     = min(t["pnl"] for t in trades)
+    wr        = wins / total * 100
+    pnl_emoji = "Up" if total_pnl >= 0 else "Down"
+    pnl_str   = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+
+    stats    = {"total": total, "wins": wins, "losses": losses, "total_pnl": total_pnl}
+    analysis = get_claude_analysis(name, trades, stats)
+
+    return (
+        f"<b>{'Blue' if name == 'Conservative' else 'Red'} {name}</b>\n"
+        f"  Trades: {total} | {wins}W {losses}L | {wr:.0f}% WR\n"
+        f"  PnL: <b>{pnl_emoji} {pnl_str}</b>\n"
+        f"  Best: +${best:.2f} | Worst: -${abs(worst):.2f}\n"
+        f"  Balance: <b>${bal:,.2f}</b>\n"
+        f"  Analysis: {analysis}"
+    )
 
 
 def send_daily_summary():
     today    = date.today().strftime("%b %d, %Y")
-    trades   = get_todays_closed_trades()
-    balance  = get_account_balance()
-
-    if not trades:
-        send_message(
-            f"📊 <b>Daily Summary — {today}</b>\n\n"
-            f"No trades closed today.\n"
-            f"Balance: ${balance['balance']:,.2f}"
-        )
-        return
-
-    total     = len(trades)
-    wins      = len([t for t in trades if t["result"] == "TP"])
-    losses    = len([t for t in trades if t["result"] == "SL"])
-    win_rate  = wins / total * 100
-    total_pnl = sum(t["pnl_pct"] for t in trades)
-    best      = max(t["pnl_pct"] for t in trades)
-    worst     = min(t["pnl_pct"] for t in trades)
-
-    stats = {
-        "total":     total,
-        "wins":      wins,
-        "losses":    losses,
-        "win_rate":  win_rate,
-        "total_pnl": total_pnl,
-        "best":      best,
-        "worst":     worst,
-    }
-
-    analysis = get_claude_analysis(trades, stats)
-
-    pnl_emoji = "📈" if total_pnl > 0 else "📉"
+    sections = []
+    for name, account_id in BOTS.items():
+        sections.append(format_bot_section(name, account_id))
 
     msg = (
-        f"📊 <b>Daily Summary — {today}</b>\n\n"
-        f"Trades: {total}  |  W: {wins}  L: {losses}  |  WR: {win_rate:.0f}%\n"
-        f"{pnl_emoji} Total P&L: <b>{total_pnl:+.3f}%</b>\n"
-        f"Best: {best:+.3f}% | Worst: {worst:+.3f}%\n"
-        f"Balance: ${balance['balance']:,.2f}\n\n"
-        f"<b>Claude Analysis:</b>\n{analysis}"
+        f"Daily Summary - {today}\n"
+        f"{'=' * 20}\n\n"
+        + "\n\n".join(sections)
     )
-
     send_message(msg)
-    print(f"[SUMMARY] Sent daily summary for {today}")
-    print(f"[SUMMARY] {total} trades | {wins}W {losses}L | {total_pnl:+.3f}% | Balance: ${balance['balance']:,.2f}")
+    print(f"[SUMMARY] Sent for {today}")
 
 
 if __name__ == "__main__":

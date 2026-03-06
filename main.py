@@ -269,7 +269,7 @@ def main():
     balance = get_account_balance()
 
     print("\n Gold AI Trading Bot v2")
-    print(f"   Top-Down | Daily+1H+5min | ADX>={TRADE_CONFIG[chr(39)+'adx_threshold'+chr(39)]}")
+    print(f"   Top-Down | Daily+1H+5min | ADX>={TRADE_CONFIG['adx_threshold']}")
     print(f"   Session: 07:00-12:00 | 13:30-17:00 UTC")
     print(f"   Balance: ${balance:,.2f}")
     print("="*60)
@@ -304,8 +304,8 @@ def main():
             else:
                 alert_error(err)
 
-        print(f"\n[BOT] Sleeping {TRADE_CONFIG[chr(39)+'poll_interval_seconds'+chr(39)]}s...")
-        time.sleep(TRADE_CONFIG[chr(39)+'poll_interval_seconds'+chr(39)])
+        print(f"\n[BOT] Sleeping {TRADE_CONFIG['poll_interval_seconds']}s...")
+        time.sleep(TRADE_CONFIG['poll_interval_seconds'])
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ TRADE_CONFIG = {
     "take_profit_pct": 0.004,    # 0.4%
     "stop_loss_pct": 0.002,      # changed from 0.003 — better risk/reward ratio
     "htf_confirmation": False,    # NEW — only trade when 1H EMA50 agrees with 15min signal
-    "conflict_mode": "risky",
+    "conflict_mode": "conservative",
     "news_lookback_hours": 24,
     "poll_interval_seconds": 300,
     "oanda_units": 1,
@@ -61,3 +61,5 @@ def validate_keys():
     }.items() if not v]
     if missing:
         raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}\nCopy .env.example to .env and fill in your keys.")
+BOT_NAME = "🔵 Conservative"
+BOT_NAME = "🔵 Conservative"

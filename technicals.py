@@ -158,10 +158,10 @@ def get_daily_bias(df_daily: pd.DataFrame) -> dict:
     bullish = price above EMA50 and slope positive
     bearish = price below EMA50 and slope negative
     """
-    if df_daily is None or df_daily.empty or len(df_daily) < 55:
+    if df_daily is None or df_daily.empty or len(df_daily) < 15:
         return {"direction": "unknown", "slope": 0.0, "ema50": 0.0}
 
-    ema50        = compute_ema(df_daily["close"], 50)
+    ema50        = compute_ema(df_daily["close"], 10)
     latest_close = df_daily["close"].iloc[-1]
     latest_ema   = ema50.iloc[-1]
     slope        = get_ema_slope(ema50, lookback=5)

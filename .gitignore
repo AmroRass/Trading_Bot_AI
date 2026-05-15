@@ -1,17 +1,28 @@
-# Secrets - NEVER commit this
+# secrets
 .env
+*.pem
 
-# Logs and data
-trade_log.csv
-*.log
-
-# Python
+# python
 __pycache__/
 *.pyc
-*.pyo
+venv/
 .venv/
-env/
 
-# OS
-.DS_Store
-Thumbs.db
+# runtime/generated folders
+logs/
+signals/
+data/
+bots/
+runtime/
+archive/
+
+# generated files
+*.log
+nohup.out
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+
+# control files
+STOP_BOT

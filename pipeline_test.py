@@ -1,6 +1,3 @@
-cd /home/ec2-user/moneymaker
-
-cat > pipeline_test.py <<'PY'
 """
 pipeline_test.py - Full wiring test for the AI-assisted trading brain
 
@@ -725,6 +722,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-PY
-
-python3 pipeline_test.py

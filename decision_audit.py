@@ -351,68 +351,97 @@ class DecisionAuditor:
         return [self._row_to_dict(row) for row in rows]
 
     def get_summary(self) -> Dict[str, Any]:
-        """Return summary counts useful for quick debugging."""
-        with self._connect() as conn:
-            total_count = conn.execute(
-                "SELECT COUNT(*) as count FROM decision_audit;"
-            ).fetchone()
+        """
+        Return summary counts for audit analysis.
 
-            final_actions = conn.execute(
-                """
-                SELECT final_action, COUNT(*) AS count
-                FROM decision_audit
-                GROUP BY final_action
-                ORDER BY count DESC;
-                """
-            ).fetchall()
-
-            claude_vs_final = conn.execute(
-                """
-                SELECT claude_decision, final_action, COUNT(*) AS count
-                FROM decision_audit
-                GROUP BY claude_decision, final_action
-                ORDER BY count DESC;
-                """
-            ).fetchall()
-
-            block_reasons = conn.execute(
-                """
-                SELECT python_block_reason, COUNT(*) AS count
-                FROM decision_audit
-                WHERE python_block_reason IS NOT NULL
-                  AND python_block_reason != ''
-                GROUP BY python_block_reason
-                ORDER BY count DESC;
-                """
-            ).fetchall()
-
-            by_instrument = conn.execute(
-                """
-                SELECT instrument, COUNT(*) AS count
-                FROM decision_audit
-                GROUP BY instrument
-                ORDER BY count DESC;
-                """
-            ).fetchall()
-
-            by_session = conn.execute(
-                """
-                SELECT session, COUNT(*) AS count
-                FROM decision_audit
-                WHERE session IS NOT NULL AND session != ''
-                GROUP BY session
-                ORDER BY count DESC;
-                """
-            ).fetchall()
-
-        return {
-            "total_decisions": dict(total_count)["count"],
-            "final_actions": [self._row_to_dict(row) for row in final_actions],
-            "claude_vs_final": [self._row_to_dict(row) for row in claude_vs_final],
-            "block_reasons": [self._row_to_dict(row) for row in block_reasons],
-            "by_instrument": [self._row_to_dict(row) for row in by_instrument],
-            "by_session": [self._row_to_dict(row) for row in by_session],
+        Important:
+            block_reasons must only include rows where final_action == BLOCKED.
+            A Claude NO_TRADE reason is not a Python block reason.
+        """
+        summary = {
+            "total_decisions": 0,
+            "final_actions": [],
+            "claude_vs_final": [],
+            "block_reasons": [],
+            "by_instrument": [],
+            "by_session": [],
         }
+
+        try:
+            with self._connect() as conn:
+                total_row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM decision_audit"
+                ).fetchone()
+                summary["total_decisions"] = int(total_row["count"]) if total_row else 0
+
+                summary["final_actions"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT final_action, COUNT(*) AS count
+                        FROM decision_audit
+                        GROUP BY final_action
+                        ORDER BY count DESC, final_action ASC
+                        """
+                    ).fetchall()
+                ]
+
+                summary["claude_vs_final"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT claude_decision, final_action, COUNT(*) AS count
+                        FROM decision_audit
+                        GROUP BY claude_decision, final_action
+                        ORDER BY count DESC, claude_decision ASC, final_action ASC
+                        """
+                    ).fetchall()
+                ]
+
+                # Only real Python-blocked decisions belong here.
+                summary["block_reasons"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT python_block_reason, COUNT(*) AS count
+                        FROM decision_audit
+                        WHERE final_action = 'BLOCKED'
+                          AND python_block_reason IS NOT NULL
+                          AND python_block_reason != ''
+                        GROUP BY python_block_reason
+                        ORDER BY count DESC, python_block_reason ASC
+                        """
+                    ).fetchall()
+                ]
+
+                summary["by_instrument"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT instrument, COUNT(*) AS count
+                        FROM decision_audit
+                        GROUP BY instrument
+                        ORDER BY count DESC, instrument ASC
+                        """
+                    ).fetchall()
+                ]
+
+                summary["by_session"] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT session, COUNT(*) AS count
+                        FROM decision_audit
+                        GROUP BY session
+                        ORDER BY count DESC, session ASC
+                        """
+                    ).fetchall()
+                ]
+
+        except Exception as e:
+            print(f"[AUDIT] Failed to get summary: {e}")
+
+        return summary
 
     def export_csv(self, output_path: Optional[str] = None) -> str:
         """

@@ -52,6 +52,9 @@ import oandapyV20.endpoints.trades as trades_ep
 import oandapyV20.endpoints.pricing as pricing_ep
 from dotenv import load_dotenv
 from anthropic import Anthropic
+
+from ai_trade_pipeline import AITradePipeline, AITradePipelineConfig
+
 load_dotenv()
 
 # ── ENV ────────────────────────────────────────────────────────────────────────
@@ -105,6 +108,17 @@ os.makedirs(LOG_DIR, exist_ok=True)
 STATE_FILE      = os.path.join(LOG_DIR, "gold_state.json")
 KILL_SWITCH     = os.path.join(BASE_DIR, "STOP_BOT")
 EC2_API         = "http://localhost:5000"
+
+# ── AI PIPELINE DRY-RUN CONFIG ─────────────────────────────────────────────────
+# Phase 1: AI pipeline is observer-only.
+# It audits what it WOULD do, but it must not place orders.
+AI_GOLD_DRY_RUN = os.getenv("AI_GOLD_DRY_RUN", "true").lower() == "true"
+AI_GOLD_EXECUTION_ENABLED = os.getenv("AI_GOLD_EXECUTION_ENABLED", "false").lower() == "true"
+AI_GOLD_AUDIT_DIR = os.path.join(LOG_DIR, "gold_ai_dry_run")
+AI_GOLD_AUDIT_DB = os.path.join(AI_GOLD_AUDIT_DIR, "decision_audit.db")
+
+if AI_GOLD_EXECUTION_ENABLED:
+    raise RuntimeError("AI_GOLD_EXECUTION_ENABLED must stay false during dry-run phase")
 
 oanda = oandapyV20.API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENVIRONMENT)
 
@@ -703,6 +717,272 @@ def mark_duplicate(state, key, price):
     state.setdefault("duplicate_signals",{})[key] = {
         "time": datetime.now(timezone.utc).isoformat(), "price": price
     }
+
+
+
+# ── AI PIPELINE DRY-RUN HELPERS ────────────────────────────────────────────────
+
+class _StaticGoldReviewer:
+    """
+    Adapter that lets ai_trade_pipeline.py review the existing gold_monitor Claude output.
+    This avoids a second Claude API call during dry-run.
+    """
+
+    def __init__(self, decision: Dict[str, Any]):
+        self.decision = dict(decision)
+
+    def review_setup(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        return dict(self.decision)
+
+
+def _count_consecutive_directional(df, direction: str) -> int:
+    if df is None or df.empty:
+        return 0
+
+    count = 0
+    for _, row in df.iloc[::-1].iterrows():
+        close = float(row["close"])
+        open_ = float(row["open"])
+
+        if direction == "bullish" and close > open_:
+            count += 1
+        elif direction == "bearish" and close < open_:
+            count += 1
+        else:
+            break
+
+    return count
+
+
+def _get_ai_extension_status(price: float, df_5m) -> str:
+    fast = get_ema_fast(df_5m, span=9)
+    atr = get_recent_range_atr(df_5m, lookback=20)
+
+    if fast is None or atr <= 0:
+        return "INSUFFICIENT_DATA"
+
+    ratio = abs(float(price) - float(fast)) / float(atr)
+
+    if ratio >= 1.5:
+        return f"EXTENDED - {ratio:.1f}x ATR from EMA9"
+    if ratio >= 1.0:
+        return f"MODERATELY EXTENDED - {ratio:.1f}x ATR from EMA9"
+    return f"OK - {ratio:.1f}x ATR from EMA9"
+
+
+def _build_ai_gold_snapshot(
+    price,
+    session,
+    levels,
+    proximity_hits,
+    df_5m,
+    df_15m,
+    macro,
+    ema,
+    ema50,
+    execution_regime,
+    events,
+) -> Dict[str, Any]:
+    above_levels, below_levels = get_structural_levels(price, levels, macro)
+
+    next_resistance = above_levels[0]["level"] if above_levels else None
+    nearest_support = below_levels[0]["level"] if below_levels else None
+
+    breakout_level = None
+    level_name = ""
+    trigger_direction = "NONE"
+    breakout_confirmed = False
+    breakdown_confirmed = False
+
+    for hit in proximity_hits:
+        name = hit.get("name")
+        level = hit.get("level")
+        if level is None:
+            continue
+
+        level = float(level)
+
+        if name in RESISTANCE_LEVELS:
+            is_breakout = has_confirmed_breakout(df_15m, level)
+            is_continuation = is_bullish_breakout_continuation(df_5m, df_15m, ema, ema50, level)
+            if is_breakout or is_continuation:
+                breakout_level = level
+                level_name = name
+                trigger_direction = "LONG"
+                breakout_confirmed = True
+                break
+
+        if name in SUPPORT_LEVELS:
+            is_breakdown = has_confirmed_breakdown(df_15m, level)
+            is_continuation = is_bearish_breakdown_continuation(df_5m, df_15m, ema, ema50, level)
+            if is_breakdown or is_continuation:
+                breakout_level = level
+                level_name = name
+                trigger_direction = "SHORT"
+                breakdown_confirmed = True
+                break
+
+    candles_above_level = 0
+    candles_below_level = 0
+    if breakout_level is not None and df_15m is not None and not df_15m.empty:
+        recent_15m = df_15m.tail(3)
+        candles_above_level = int((recent_15m["close"].astype(float) > float(breakout_level)).sum())
+        candles_below_level = int((recent_15m["close"].astype(float) < float(breakout_level)).sum())
+
+    ema_alignment = "neutral"
+    if ema:
+        try:
+            fast = float(ema.get("fast", 0))
+            slow = float(ema.get("slow", 0))
+            if fast > slow:
+                ema_alignment = "bullish"
+            elif fast < slow:
+                ema_alignment = "bearish"
+        except Exception:
+            ema_alignment = "neutral"
+
+    if ema50 is None:
+        price_vs_ema50 = "unknown"
+    else:
+        price_vs_ema50 = "above" if float(price) > float(ema50) else "below"
+
+    return {
+        "instrument": INSTRUMENT,
+        "current_price": float(price),
+        "session": session,
+        "regime": execution_regime,
+        "daily_trend": macro.get("trend", "UNKNOWN"),
+        "market_state": execution_regime,
+        "breakout_level": breakout_level,
+        "next_resistance": next_resistance,
+        "nearest_support": nearest_support,
+        "level_name": level_name,
+        "trigger_direction": trigger_direction,
+        "breakout_confirmed": breakout_confirmed,
+        "breakdown_confirmed": breakdown_confirmed,
+        "candles_above_level": candles_above_level,
+        "candles_below_level": candles_below_level,
+        "consecutive_bullish_candles": _count_consecutive_directional(df_5m, "bullish"),
+        "consecutive_bearish_candles": _count_consecutive_directional(df_5m, "bearish"),
+        "ema_alignment": ema_alignment,
+        "price_vs_ema50": price_vs_ema50,
+        "extension_check": _get_ai_extension_status(float(price), df_5m),
+        "distance_from_entry": abs(float(price) - float(breakout_level)) if breakout_level is not None else 0.0,
+        "news_nearby": bool(is_news_blocked(events)[0]) if events is not None else False,
+    }
+
+
+def _legacy_parsed_to_ai_decision(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    setup = str(parsed.get("SETUP", "NO TRADE")).upper().strip()
+    confidence = str(parsed.get("CONFIDENCE", "LOW")).upper().strip()
+
+    if setup in {"LONG", "SHORT"}:
+        return {
+            "decision": "ENTER_NOW",
+            "setup": setup,
+            "confidence": confidence if confidence in {"HIGH", "MEDIUM", "LOW"} else "LOW",
+            "entry_style": "BREAKOUT",
+            "reason": parsed.get("REASON", "Legacy gold_monitor Claude proposed an entry."),
+            "risk_comment": "AI dry-run: Python pipeline must validate objective safety before any future execution.",
+            "is_late_chase": False,
+            "needs_pullback": False,
+        }
+
+    return {
+        "decision": "NO_TRADE",
+        "setup": "NONE",
+        "confidence": "LOW",
+        "entry_style": "NONE",
+        "reason": parsed.get("REASON", "Legacy gold_monitor Claude did not propose a trade."),
+        "risk_comment": "No execution considered.",
+        "is_late_chase": False,
+        "needs_pullback": False,
+    }
+
+
+def run_ai_gold_dry_run(
+    parsed,
+    price,
+    session,
+    levels,
+    proximity_hits,
+    df_5m,
+    df_15m,
+    macro,
+    ema,
+    ema50,
+    execution_regime,
+    events,
+):
+    """
+    Observer-only AI pipeline integration.
+
+    It audits/logs what the new AI pipeline would do using the existing Claude
+    decision from gold_monitor.py. It never places orders and never modifies
+    the old execution decision.
+    """
+    if not AI_GOLD_DRY_RUN:
+        return None
+
+    try:
+        snapshot = _build_ai_gold_snapshot(
+            price=price,
+            session=session,
+            levels=levels,
+            proximity_hits=proximity_hits,
+            df_5m=df_5m,
+            df_15m=df_15m,
+            macro=macro,
+            ema=ema,
+            ema50=ema50,
+            execution_regime=execution_regime,
+            events=events,
+        )
+
+        ai_decision = _legacy_parsed_to_ai_decision(parsed)
+
+        pipeline = AITradePipeline(
+            config=AITradePipelineConfig(
+                instrument=INSTRUMENT,
+                use_real_claude=False,
+                only_review_interesting_setups=False,
+                min_rr=MIN_RR,
+                min_stop_distance=MIN_STOP_PTS,
+                max_stop_distance=MAX_STOP_PTS,
+                stop_buffer=2.0,
+                block_extended=True,
+                block_moderately_extended=False,
+                allow_london=True,
+                allow_new_york=True,
+                allow_off_hours=False,
+                audit_enabled=True,
+                audit_db_path=AI_GOLD_AUDIT_DB,
+                source="gold_monitor_ai_dry_run",
+            ),
+            reviewer=_StaticGoldReviewer(ai_decision),
+        )
+
+        result = pipeline.evaluate_snapshot(snapshot)
+
+        print(
+            "[AI-DRY-RUN] "
+            f"legacy={ai_decision.get('setup')} "
+            f"final={result.get('final_action')} "
+            f"code={result.get('final_reason_code')} "
+            f"rr={result.get('python_validation', {}).get('rr')}"
+        )
+        print(f"[AI-DRY-RUN] reason={result.get('final_reason')}")
+
+        return result
+
+    except Exception as e:
+        print(f"[AI-DRY-RUN] Failed safely: {e}")
+        return {
+            "final_action": "NO_TRADE",
+            "final_reason": f"AI dry-run failed safely: {e}",
+            "final_reason_code": "AI_DRY_RUN_ERROR",
+            "audit_logged": False,
+        }
 
 
 # ── CLAUDE PROMPT ──────────────────────────────────────────────────────────────
@@ -1310,6 +1590,21 @@ def main():
                 sd = abs(e-s); td = abs(t-e)
                 if sd>0 and td>0: parsed["RR"] = str(round(td/sd,2))
                 parsed["STOP_DIST"] = str(round(sd,1))
+
+        ai_dry_run_result = run_ai_gold_dry_run(
+            parsed=parsed,
+            price=price,
+            session=session,
+            levels=levels,
+            proximity_hits=proximity_hits,
+            df_5m=df_5m,
+            df_15m=df_15m,
+            macro=macro,
+            ema=ema,
+            ema50=ema50,
+            execution_regime=execution_regime,
+            events=events,
+        )
 
         shadow_id  = None
         shadow_msg = ""

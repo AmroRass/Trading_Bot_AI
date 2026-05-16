@@ -364,6 +364,47 @@ class MockReviewer:
         }
 
 
+
+class CrashReviewer:
+    """
+    Simulates Claude/API crashing.
+    Expected pipeline behaviour: safe NO_TRADE.
+    """
+
+    def review_setup(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        raise RuntimeError("Simulated reviewer crash")
+
+
+class GarbageReviewer:
+    """
+    Simulates Claude/API returning invalid output.
+    Expected pipeline behaviour: safe NO_TRADE.
+    """
+
+    def review_setup(self, snapshot: Dict[str, Any]) -> Any:
+        return "buy now bro"
+
+
+class AlwaysLongReviewer:
+    """
+    Simulates Claude incorrectly forcing LONG.
+    Useful when Python snapshot says SHORT.
+    Expected pipeline behaviour: BLOCKED by SETUP_DIRECTION_MISMATCH.
+    """
+
+    def review_setup(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "decision": "ENTER_NOW",
+            "setup": "LONG",
+            "confidence": "HIGH",
+            "entry_style": "BREAKOUT",
+            "reason": "Bad mock reviewer: forcing LONG.",
+            "risk_comment": "Python should catch direction mismatch.",
+            "is_late_chase": False,
+            "needs_pullback": False,
+        }
+
+
 def _clean_test_db(path: str) -> None:
     p = Path(path)
 
@@ -432,6 +473,34 @@ def _no_setup_snapshot() -> Dict[str, Any]:
     return snap
 
 
+
+def _short_snapshot_ok() -> Dict[str, Any]:
+    return {
+        "instrument": "XAU_USD",
+        "current_price": 4693.0,
+        "session": "NEW YORK",
+        "regime": "BEARISH",
+        "daily_trend": "RANGING",
+        "market_state": "BEARISH_BREAKDOWN",
+        "breakout_level": 4700.0,
+        "next_resistance": 4705.0,
+        "nearest_support": 4625.0,
+        "level_name": "today_low",
+        "trigger_direction": "SHORT",
+        "breakout_confirmed": False,
+        "breakdown_confirmed": True,
+        "candles_above_level": 0,
+        "candles_below_level": 3,
+        "consecutive_bullish_candles": 0,
+        "consecutive_bearish_candles": 3,
+        "ema_alignment": "bearish",
+        "price_vs_ema50": "below",
+        "extension_check": "OK - within 1.1x ATR of EMA9",
+        "distance_from_entry": 7.0,
+        "news_nearby": False,
+    }
+
+
 def run_tests() -> None:
     print("=" * 80)
     print("TESTING AI TRADE PIPELINE")
@@ -474,6 +543,121 @@ def run_tests() -> None:
         _assert(name, result["final_reason_code"] == expected_code, result)
         print(f"✅ {name}")
 
+    print("\n" + "=" * 80)
+    print("TESTING GOLD HARDENING CASES")
+    print("=" * 80)
+
+    hardening_cases = []
+
+    hardening_cases.append((
+        "Reviewer crash fails safe",
+        AITradePipeline(
+            config=AITradePipelineConfig(
+                instrument="XAU_USD",
+                use_real_claude=False,
+                audit_db_path=db_path,
+                source="ai_pipeline_hardening_crash",
+            ),
+            reviewer=CrashReviewer(),
+        ),
+        _long_snapshot_ok(),
+        "NO_TRADE",
+        "CLAUDE_DID_NOT_REQUEST_ENTRY",
+        True,
+    ))
+
+    hardening_cases.append((
+        "Reviewer garbage fails safe",
+        AITradePipeline(
+            config=AITradePipelineConfig(
+                instrument="XAU_USD",
+                use_real_claude=False,
+                audit_db_path=db_path,
+                source="ai_pipeline_hardening_garbage",
+            ),
+            reviewer=GarbageReviewer(),
+        ),
+        _long_snapshot_ok(),
+        "NO_TRADE",
+        "CLAUDE_DID_NOT_REQUEST_ENTRY",
+        True,
+    ))
+
+    hardening_cases.append((
+        "Claude LONG but Python SHORT blocks",
+        AITradePipeline(
+            config=AITradePipelineConfig(
+                instrument="XAU_USD",
+                use_real_claude=False,
+                audit_db_path=db_path,
+                source="ai_pipeline_hardening_mismatch",
+            ),
+            reviewer=AlwaysLongReviewer(),
+        ),
+        _short_snapshot_ok(),
+        "BLOCKED",
+        "SETUP_DIRECTION_MISMATCH",
+        True,
+    ))
+
+    missing_long_target = _long_snapshot_ok()
+    missing_long_target["next_resistance"] = None
+    hardening_cases.append((
+        "Gold LONG missing target blocks",
+        pipeline,
+        missing_long_target,
+        "BLOCKED",
+        "MISSING_TARGET",
+        True,
+    ))
+
+    missing_short_support = _short_snapshot_ok()
+    missing_short_support["nearest_support"] = None
+    hardening_cases.append((
+        "Gold SHORT missing support blocks",
+        pipeline,
+        missing_short_support,
+        "BLOCKED",
+        "MISSING_TARGET",
+        True,
+    ))
+
+    hardening_cases.append((
+        "Audit disabled does not crash",
+        AITradePipeline(
+            config=AITradePipelineConfig(
+                instrument="XAU_USD",
+                use_real_claude=False,
+                audit_enabled=False,
+                source="ai_pipeline_hardening_no_audit",
+            ),
+            reviewer=MockReviewer(),
+        ),
+        _long_snapshot_ok(),
+        "ENTER_NOW",
+        "VALIDATION_PASSED",
+        False,
+    ))
+
+    for i, (name, test_pipeline, snapshot, expected_action, expected_code, expected_audit) in enumerate(hardening_cases, start=1):
+        print(f"\n[HARDENING TEST {i}] {name}")
+        print("-" * 80)
+
+        result = test_pipeline.evaluate_snapshot(snapshot)
+        print(json.dumps({
+            "final_action": result["final_action"],
+            "final_reason_code": result["final_reason_code"],
+            "audit_logged": result["audit_logged"],
+            "claude_decision": result["claude_decision"],
+            "python_validation": result["python_validation"],
+        }, indent=2))
+
+        _assert(name, result["final_action"] == expected_action, result)
+        _assert(name, result["final_reason_code"] == expected_code, result)
+        _assert(name, result["audit_logged"] == expected_audit, result)
+
+        print(f"✅ {name}")
+
     auditor = pipeline._create_auditor(db_path)
     if auditor is None:
         raise AssertionError("Could not create DecisionAuditor for summary check.")
@@ -484,7 +668,7 @@ def run_tests() -> None:
     print("-" * 80)
     print(json.dumps(summary, indent=2))
 
-    _assert("Audit total decisions", summary["total_decisions"] == 3, summary)
+    _assert("Audit total decisions", summary["total_decisions"] == 8, summary)
 
     print("\n" + "=" * 80)
     print("AI TRADE PIPELINE TESTS COMPLETE")

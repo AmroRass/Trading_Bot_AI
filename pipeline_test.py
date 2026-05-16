@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from market_snapshot import MarketSnapshotBuilder
 from decision_audit import DecisionAuditor
+from python_validation import PythonTradeValidator, ValidationConfig
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -285,74 +286,20 @@ def get_claude_decision(snapshot: Dict[str, Any], use_real_claude: bool) -> Dict
 # Python validation stub
 # ──────────────────────────────────────────────────────────────────────────────
 
-def python_validation_stub(
-    snapshot: Dict[str, Any],
-    claude_decision: Dict[str, Any],
-) -> Dict[str, Any]:
+def python_validation_stub(snapshot, claude_decision):
     """
-    Temporary validation layer.
+    Real Python validation layer.
 
-    This is NOT the final risk engine.
-    Later this becomes python_validation.py.
-
-    Current checks:
-        - Claude must say ENTER_NOW
-        - setup must match trigger direction
-        - extension blocks entry
-        - R:R and stop distance are placeholder values
+    Kept under the old function name so the existing pipeline test wiring
+    does not need to change yet.
     """
-    claude_action = claude_decision.get("decision", "NO_TRADE")
-    claude_setup = claude_decision.get("setup", "NONE")
-    trigger_direction = snapshot.get("trigger_direction", "NONE")
-    extension_check = snapshot.get("extension_check", "")
-    distance_from_entry = float(snapshot.get("distance_from_entry") or 0)
+    instrument = str(snapshot.get("instrument") or "XAU_USD")
 
-    if claude_action != "ENTER_NOW":
-        return {
-            "passed": None,
-            "reason_code": "CLAUDE_DID_NOT_REQUEST_ENTRY",
-            "reason": "Claude did not recommend immediate entry.",
-            "rr": None,
-            "stop_distance": None,
-        }
+    validator = PythonTradeValidator(
+        ValidationConfig(instrument=instrument)
+    )
 
-    if trigger_direction == "NONE":
-        return {
-            "passed": False,
-            "reason_code": "NO_TRIGGER_DIRECTION",
-            "block_reason_code": "NO_TRIGGER_DIRECTION",
-            "reason": "No confirmed LONG/SHORT trigger direction.",
-            "rr": None,
-            "stop_distance": None,
-        }
-
-    if claude_setup != trigger_direction:
-        return {
-            "passed": False,
-            "reason_code": "SETUP_DIRECTION_MISMATCH",
-            "block_reason_code": "SETUP_DIRECTION_MISMATCH",
-            "reason": f"Claude setup {claude_setup} does not match trigger direction {trigger_direction}.",
-            "rr": None,
-            "stop_distance": None,
-        }
-
-    if extension_check.startswith("EXTENDED"):
-        return {
-            "passed": False,
-            "reason_code": "PRICE_EXTENDED",
-            "block_reason_code": "PRICE_EXTENDED",
-            "reason": f"Price is too extended for immediate entry: {extension_check}",
-            "rr": 1.4,
-            "stop_distance": max(20.0, distance_from_entry + 15.0),
-        }
-
-    return {
-        "passed": True,
-        "reason_code": "VALIDATION_PASSED",
-        "reason": "Placeholder validation passed.",
-        "rr": 2.8,
-        "stop_distance": max(20.0, distance_from_entry + 15.0),
-    }
+    return validator.validate(snapshot, claude_decision)
 
 
 def decide_final_action(
@@ -715,7 +662,7 @@ def main() -> None:
     print_header("PIPELINE TESTS COMPLETE")
     print("✅ market_snapshot.py works in pipeline")
     print("✅ Claude review layer works in pipeline")
-    print("✅ Python validation stub works in pipeline")
+    print("✅ Real Python validator works in pipeline")
     print("✅ decision_audit.py logs pipeline decisions")
     print(f"Audit DB saved to: {db_path}")
 
